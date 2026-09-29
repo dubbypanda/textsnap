@@ -1,6 +1,8 @@
 # textsnap model checksums — SHA-256 digests of the PaddleOCR-VL-1.5 ONNX
 # files auto-downloaded from the Hugging Face Hub repo:
-#   onnx-community/PaddleOCR-VL-1.5-ONNX  (revision: main)
+#   kouhxp/PaddleOCR-VL-1.5-ONNX  (revision: 1605cb733ff4d1136bdb0f43f35bc717f36f58a9)
+# a byte-identical mirror of onnx-community/PaddleOCR-VL-1.5-ONNX
+# at 371b52d142968ff09e9cb5275a75eae55aa27a96.
 #
 # Format: "<sha256>  <repo-relative path>", i.e. the same layout as the
 # output of `sha256sum`. Lines beginning with # and blank lines are ignored.
@@ -16,3 +18,9 @@ d737d600be1bd90ec1e3b537ffe1645a6d780de688904ca4301353df6086f46e  onnx/vision_en
 91b1babbe9dbc44f2b59f8462cbf27dd1520a88b1b85695e342b05e5b4a50004  onnx/embedding.onnx
 c8a215a59183d0d0781adc33bacd3ce6162716f7fd568fb30234a74d69803a7d  tokenizer.json
 164809b94c8dd5b352cb9a0b9964572844398faeab27f9a6e1dd7d1a984410c8  config.json
+# External-data sidecar holding the 424 MB embedding table (embedding.onnx
+# itself is only the 1.8 kB graph that points at it).
+a2299447a5449d9bc68e4d1d1ab32b214a0e8c06f98244fbc7487342187ae6f3  onnx/embedding.onnx.data
+# Default vision encoder (vision_encoder_q4.onnx above is used only with
+# --vision q4).
+caf7ea82a44c9e3b5a4093129f3b9e467c4a831c9f0068aa911518cee1eadfb1  onnx/vision_encoder_q8.onnx
