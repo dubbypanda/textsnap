@@ -1,18 +1,28 @@
-# textsnap model checksums — SHA-256 digests of the PaddleOCR-VL-1.5 ONNX
-# files auto-downloaded from the Hugging Face Hub repo:
-#   kouhxp/PaddleOCR-VL-1.5-ONNX  (revision: 1605cb733ff4d1136bdb0f43f35bc717f36f58a9)
-# a byte-identical mirror of onnx-community/PaddleOCR-VL-1.5-ONNX
-# at 371b52d142968ff09e9cb5275a75eae55aa27a96.
+# textsnap model checksums -- SHA-256 digests of every model file textsnap
+# downloads, from two Hugging Face Hub repos (both textsnap-owned mirrors):
+#
+#   kouhxp/PP-OCRv6_medium-ONNX  (revision: 75776f6b3864e7b3d2144c29e0278243b60e4e8f)
+#     a byte-identical repack of PaddlePaddle/PP-OCRv6_medium_det_onnx @
+#     61323801669c338b7891481ec7bac61ce31b576a and
+#     PaddlePaddle/PP-OCRv6_medium_rec_onnx @
+#     50c7eacafc52fa7bcf4194e8cd08e46f8558504b.
+#   kouhxp/PaddleOCR-VL-1.5-ONNX (revision: 1605cb733ff4d1136bdb0f43f35bc717f36f58a9)
+#     a byte-identical mirror of onnx-community/PaddleOCR-VL-1.5-ONNX
+#     at 371b52d142968ff09e9cb5275a75eae55aa27a96.
 #
 # Format: "<sha256>  <repo-relative path>", i.e. the same layout as the
 # output of `sha256sum`. Lines beginning with # and blank lines are ignored.
-#
-# For the large .onnx tensors these digests are the canonical git-LFS object
-# IDs (sha256 of file content); for the small JSON files they are the sha256
-# of the raw bytes. Both verify directly against sha256sum of the downloaded
-# file.
+# Paths are unique across the two repos (det/, rec/ vs onnx/, *.json).
 #
 # To regenerate after a model revision bump:  textsnap --generate-checksums
+
+# ---- PP-OCRv6 medium (default engine) --------------------------------------
+eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1  det/inference.onnx
+7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871  det/inference.yml
+9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba  rec/inference.onnx
+991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129  rec/inference.yml
+
+# ---- PaddleOCR-VL-1.5 (fallback and --structured) --------------------------
 d737d600be1bd90ec1e3b537ffe1645a6d780de688904ca4301353df6086f46e  onnx/vision_encoder_q4.onnx
 87858a011c3f5ae8b373ec7298fba781dfe3ceb49828a803a197becdee26853c  onnx/decoder_q4.onnx
 91b1babbe9dbc44f2b59f8462cbf27dd1520a88b1b85695e342b05e5b4a50004  onnx/embedding.onnx

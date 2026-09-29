@@ -30,6 +30,13 @@ tok = types.ModuleType("tokenizers"); tok.Tokenizer = Tokenizer
 sys.modules["tokenizers"] = tok
 sys.modules["huggingface_hub"] = types.ModuleType("huggingface_hub")
 sys.modules["readability"] = types.ModuleType("readability")
+# wordfreq stub: a tiny English lexicon is enough to exercise the gate.
+_LEX = set("""the a an of to and in is it for on as with was day reminder
+moon tells sky sea tide me quarterly report region revenue total page this
+that be are from by at or not have has but your our more""".split())
+wf = types.ModuleType("wordfreq")
+wf.zipf_frequency = lambda w, lang: 5.0 if (lang == "en" and w in _LEX) else 0.0
+sys.modules.setdefault("wordfreq", wf)
 
 sys.path.insert(0, str(Path(__file__).parent))
 import textsnap as ts
@@ -270,7 +277,7 @@ def test_parity_and_batch(tmp):
     ts.OCREngine = Counting
     try:
         sys.argv = ["textsnap", str(imgs[0]), str(tmp / "missing.png"), str(imgs[1]),
-                    str(imgs[2]), "--model-dir", str(md), "-o", str(out_dir), "--max-tokens", "120"]
+                    str(imgs[2]), "--model-dir", str(md), "-o", str(out_dir), "--max-tokens", "120", "--structured"]
         code, out, err = run_capture(ts.main)
     finally:
         ts.OCREngine = real
@@ -284,13 +291,13 @@ def test_parity_and_batch(tmp):
 
     # ---- glob expansion (unexpanded pattern, as on Windows) ---------------
     sys.argv = ["textsnap", str(tmp / "in*" / "*.png"), "--model-dir", str(md),
-                "-o", str(tmp / "out_glob"), "--max-tokens", "120", "--plaintext"]
+                "-o", str(tmp / "out_glob"), "--max-tokens", "120", "--plaintext", "--structured"]
     code, out, err = run_capture(ts.main)
     assert code == 0 and len(out.split()) == 3, (code, out, err)
     print("  glob pattern expanded to", len(out.split()), "inputs")
 
     # ---- single input: behaviour unchanged --------------------------------
-    sys.argv = ["textsnap", str(imgs[0]), "--model-dir", str(md), "-o", str(tmp / "one.txt"), "--max-tokens", "120"]
+    sys.argv = ["textsnap", str(imgs[0]), "--model-dir", str(md), "-o", str(tmp / "one.txt"), "--max-tokens", "120", "--markdown"]
     code, out, err = run_capture(ts.main)
     assert code == 0 and out.strip() == str(tmp / "one.txt") and (tmp / "one.txt").read_text() == ref[0]
     sys.argv = ["textsnap", str(tmp / "nope.png"), "--model-dir", str(md)]
@@ -338,10 +345,215 @@ def test_model_files_and_checksums(tmp):
     assert sums["onnx/embedding.onnx.data"].startswith("a2299447")
     print("  file registry, portable check, manifest/embedded digests consistent; old manifest merged:", src)
 
+
+# ---------------------------------------------------------------------------
+# PP-OCRv6 path: toy det/rec graphs with the real I/O contract
+#   det: x (1,3,H,W) BGR-normalized -> (1,1,H,W) probability map
+#   rec: x (N,3,48,W)               -> (N,W/4,C) softmax over CTC classes
+# ---------------------------------------------------------------------------
+CHARS = ["!", "'", "#", "$", "\\", "~", "\u3000"] + list("abcdefghijklmnopqrstuvwxyz")
+
+def _yml_scalar(c):
+    if c == "'":
+        return "'" * 4                     # YAML: '' inside single quotes
+    if c in "!#~":
+        return "'" + c + "'"
+    return c
+
+def rec_yml(chars=CHARS):
+    return ("Global:\n  model_name: PP-OCRv6_medium_rec\nPreProcess:\n  transform_ops:\n"
+            "  - RecResizeImg:\n      image_shape:\n      - 3\n      - 48\n      - 320\n"
+            "PostProcess:\n  name: CTCLabelDecode\n  character_dict:\n"
+            + "".join("  - " + _yml_scalar(c) + "\n" for c in chars))
+
+DET_YML = ("Global:\n  model_name: PP-OCRv6_medium_det\nPostProcess:\n  box_thresh: 0.45\n"
+           "  max_candidates: 3000\n  name: DBPostProcess\n  thresh: 0.2\n  unclip_ratio: 1.4\n"
+           "PreProcess:\n  transform_ops:\n  - DecodeImage:\n      img_mode: BGR\n")
+
+def build_ppocr_dir(root, n_chars=len(CHARS), with_space=True):
+    d = Path(root) / "ppocr"
+    (d / "det").mkdir(parents=True, exist_ok=True); (d / "rec").mkdir(exist_ok=True)
+    # det: dark pixels -> high text probability.
+    (d / "det/inference.onnx").write_bytes(model(
+        [node("ReduceMean", ["x"], ["m"], "rm", [a_ints("axes", [1]), a_int("keepdims", 1)]),
+         node("Mul", ["m", "k"], ["z"], "mul"), node("Add", ["z", "b"], ["z2"], "add"),
+         node("Sigmoid", ["z2"], ["p"], "sig")],
+        [tensor("k", np.array([-8.0], np.float32)), tensor("b", np.array([-2.0], np.float32))],
+        [vi("x", 1, [1, 3, "h", "w"])], [vi("p", 1, [1, 1, "h", "w"])]))
+    (d / "det/inference.yml").write_text(DET_YML)
+    # rec: 4-px column pooling; bright -> class 1, darker -> class 2.
+    C = n_chars + 1 + (1 if with_space else 0)
+    w = np.full((1, C), 0.0, np.float32); w[0, 1], w[0, 2] = 6.0, -6.0
+    # Decision point at v=0.5 (normalized): unclipped crops are ~2.4x the
+    # bar's height, so a "dark" column averages well above -1.
+    b = np.full((C,), -50.0, np.float32); b[:3] = (0.0, -3.0, 3.0)
+    (d / "rec/inference.onnx").write_bytes(model(
+        [node("AveragePool", ["x"], ["ap"], "ap", [a_ints("kernel_shape", [48, 4]), a_ints("strides", [48, 4])]),
+         node("ReduceMean", ["ap"], ["rm"], "rm", [a_ints("axes", [1, 2]), a_int("keepdims", 0)]),
+         node("Unsqueeze", ["rm", "ax"], ["u"], "u"),
+         node("MatMul", ["u", "w"], ["l0"], "mm"), node("Add", ["l0", "b"], ["l"], "add"),
+         node("Softmax", ["l"], ["y"], "sm", [a_int("axis", -1)])],
+        [tensor("w", w), tensor("b", b), tensor("ax", np.array([-1], np.int64))],
+        [vi("x", 1, ["n", 3, 48, "w"])], [vi("y", 1, ["n", "t", C])]))
+    (d / "rec/inference.yml").write_text(rec_yml(CHARS[:n_chars]))
+    return d
+
+def page_image(path, lines=((40, 30, 360, 60), (40, 100, 300, 130))):
+    a = np.full((200, 420, 3), 255, np.uint8)
+    for x0, y0, x1, y1 in lines:
+        a[y0:y1, x0:x1] = 0
+        a[y0 + 8:y1 - 8, x0 + 60:x0 + 90] = 255   # a bright gap inside the "line"
+    Image.fromarray(a).save(path)
+    return path
+
+def test_yaml_and_decode(tmp):
+    import yaml
+    txt = rec_yml()
+    got = ts.parse_inference_yml(txt)["PostProcess"]
+    ref = yaml.safe_load(txt)["PostProcess"]
+    assert got["character_dict"] == [str(c) for c in ref["character_dict"]] == CHARS, got["character_dict"][:8]
+    det = ts.parse_inference_yml(DET_YML)["PostProcess"]
+    assert det["thresh"] == "0.2" and det["box_thresh"] == "0.45" and det["unclip_ratio"] == "1.4"
+    # CTC: repeats collapse, blanks split, score = mean prob of kept chars.
+    cs = ["<blank>", "a", "b", " "]
+    seq = [1, 1, 0, 1, 2, 2, 3, 0]
+    probs = np.full((1, len(seq), 4), 0.01, np.float32)
+    for t, k in enumerate(seq): probs[0, t, k] = 0.9 if k else 0.97
+    (text, score), = ts.ctc_decode(probs, cs)
+    assert text == "aab " and abs(score - 0.9) < 1e-6, (text, score)
+    (text, score), = ts.ctc_decode(np.eye(4, dtype=np.float32)[[0, 0, 0]][None], cs)
+    assert text == "" and score == 0.0
+    print("  inference.yml parser matches PyYAML; CTC decode collapses/blanks/scores correctly")
+
+def test_det_geometry(tmp):
+    import cv2
+    # A rotated, filled rectangle in a probability map comes back as one quad
+    # that covers it, grown by the unclip distance and scaled to the original.
+    pred = np.zeros((200, 300), np.float32)
+    rect = ((150, 100), (160, 30), 12.0)
+    cv2.fillPoly(pred, [cv2.boxPoints(rect).astype(np.int32)], 0.9)
+    boxes, scores = ts.db_boxes(pred, 600, 400, 0.2, 0.45, 1.4)
+    assert len(boxes) == 1 and scores[0] > 0.8, (boxes, scores)
+    q = boxes[0]
+    w, h = np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[3] - q[0])
+    d = 160 * 30 * 1.4 / (2 * (160 + 30))
+    assert abs(w - 2 * (160 + 2 * d)) < 8 and abs(h - 2 * (30 + 2 * d)) < 8, (w, h)
+    assert q[0][0] < q[1][0] and q[0][1] < q[3][1], q          # TL, TR, BR, BL
+    assert ts.det_resize(20, 50) == (64, 160) and ts.det_resize(5000, 3000) == (4000, 2400)
+    # Reading order: two cells on one row, a paragraph gap, then another row.
+    B = lambda x0, y0, x1, y1: np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+    txt = ts.assemble_lines([B(200, 10, 300, 30), B(10, 12, 150, 31), B(10, 80, 100, 100), B(10, 40, 90, 60)],
+                            ["world", "hello", "para two", "next"])
+    assert txt == "hello world\nnext\n\npara two", repr(txt)
+    print(f"  DB quad {w:.0f}x{h:.0f} (expected ~{2*(160+2*d):.0f}x{2*(30+2*d):.0f}); reading order + paragraph break ok")
+
+def test_quality_gate(tmp):
+    ok = lambda t, s=0.98: ts.line_ok(t, s)
+    assert ok("day as a reminder of the")
+    assert not ok("day as a reminder of the", 0.5)                  # low confidence
+    for bad in ("|||", "llIl1", "l1Il|", "-------", "aaaaaah", "x", "xqzt vbnm plkj wrtz",
+                "a1#b c2$d", "@@##$$%%"):
+        assert not ok(bad), bad
+    assert ok("Total $1,299.00") and ok("v1.2-beta") and ok("东京の天気は晴れ")
+    assert ts.line_ok("the moon tells", 0.99, ("fr",)) is False      # wrong language list
+    assert ts.line_ok("the moon tells", 0.99, ("fr", "en"))
+    res = {"rec_texts": ["The Quarterly Report", "", "|||", "revenue by region is on this page"],
+           "rec_scores": [0.99, 0.0, 0.95, 0.97]}
+    q = ts.page_quality(res)
+    assert abs(q - (20 + 33) / (20 + 3 + 33)) < 1e-9, q               # empty line ignored, '|||' weighed by length
+    assert ts.page_quality({"rec_texts": [], "rec_scores": []}) == 0.0
+    print(f"  line checks behave; page quality weighted by chars = {q:.3f}")
+
+def test_ppocr_engine_and_fallback(tmp):
+    root = tmp / "both"; build_model_dir(root); build_ppocr_dir(root)
+    img = page_image(tmp / "doc.png")
+    eng = ts.PPOCREngine(root / "ppocr")
+    assert eng.det_params == {"thresh": 0.2, "box_thresh": 0.45, "unclip_ratio": 1.4, "max_candidates": 3000}
+    res = eng.recognize(Image.open(img))
+    assert len(res["rec_polys"]) == 2 and len(res["rec_texts"]) == 2, res
+    ys = sorted(float(b[:, 1].mean()) for b in res["rec_polys"])
+    assert abs(ys[0] - 45) < 6 and abs(ys[1] - 115) < 6, ys
+    # bright margin -> "!", dark bar -> "'", bright gap -> "!", dark bar -> "'"
+    assert all(set(t) <= {"!", "'"} and t.startswith("!'") and "'!'" in t
+               for t in res["rec_texts"]), res["rec_texts"]
+    assert res["text"].count("\n") >= 1 and ts.page_quality(res) == 0.0
+    # Model without the trailing space class is accepted too; a wrong dict is not.
+    build_ppocr_dir(tmp / "nospace", with_space=False)
+    ts.PPOCREngine(tmp / "nospace/ppocr").recognize(Image.open(img))
+    build_ppocr_dir(tmp / "bad", n_chars=len(CHARS) - 3)
+    (tmp / "bad/ppocr/rec/inference.yml").write_text(rec_yml())
+    code, _, err = run_capture(lambda: ts.PPOCREngine(tmp / "bad/ppocr"))
+    assert code == 1 and "classes" in err, err
+    print("  engine: 2 lines found at the right rows; charset/class-count check works")
+
+    vlm_ref = ts.run_ocr(Image.open(img).convert("RGB"), root, max_tokens=60)
+    def cli(*extra):
+        sys.argv = ["textsnap", str(img), "--model-dir", str(root), "-o", str(tmp / "o.txt"),
+                    "--max-tokens", "60", "-v", *extra]
+        code, out, err = run_capture(ts.main)
+        assert code == 0, err
+        return (tmp / "o.txt").read_text(), err
+    # Garbage PP-OCR text -> quality 0 -> VLM re-read, flattened to plain text.
+    text, err = cli()
+    assert text == ts.to_plaintext(vlm_ref) and "Falling back" in err and ", vlm)" in err, err[-400:]
+    # --min-quality 0: never fall back; output is PP-OCR's assembled text.
+    text, err = cli("--min-quality", "0")
+    assert text == res["text"] and ", ppocr)" in err and "Falling back" not in err
+    # --structured: VLM only, native markdown, PP-OCR never loaded.
+    loads = []
+    real = ts.PPOCREngine
+    class Counting(real):
+        def __init__(s, *a, **k): loads.append(1); super().__init__(*a, **k)
+    ts.PPOCREngine = Counting
+    try:
+        text, err = cli("--structured")
+    finally:
+        ts.PPOCREngine = real
+    assert text == vlm_ref and loads == [], (loads, text[:40])
+    # VLM missing -> keep PP-OCR text, warn once, don't fail the input.
+    only = tmp / "only_ppocr"; build_ppocr_dir(only)
+    sys.argv = ["textsnap", str(img), str(img), "--model-dir", str(only), "-o", str(tmp / "od")]
+    code, out, err = run_capture(ts.main)
+    assert code == 0 and len(out.split()) == 2, (code, err)
+    assert err.count("PaddleOCR-VL unavailable") == 1, err
+    assert Path(out.split()[0]).read_text() == res["text"]
+    # Bad threshold is rejected by argparse.
+    sys.argv = ["textsnap", str(img), "--min-quality", "1.5"]
+    code, _, err = run_capture(ts.main)
+    assert code == 2 and "between 0 and 1" in err
+    print("  CLI: fallback on low quality, --min-quality 0, --structured (no PP-OCR load), "
+          "missing VLM degrades gracefully")
+
+def test_ppocr_pinning(tmp):
+    assert ts.PPOCR_HF_REPO == "kouhxp/PP-OCRv6_medium-ONNX"
+    for f in ts.PPOCR_FILES:
+        assert f in ts.EMBEDDED_CHECKSUMS
+    pinned = ts._HEX40.match(ts.PPOCR_HF_REVISION)
+    if not pinned:
+        # Unpinned mirror: a download must refuse rather than fetch "main".
+        old = ts.CACHE_DIR; ts.CACHE_DIR = tmp / "cache"
+        real_dirs = ts._script_dirs; ts._script_dirs = lambda: []
+        try:
+            code, _, err = run_capture(lambda: ts.get_ppocr_dir())
+        finally:
+            ts.CACHE_DIR = old; ts._script_dirs = real_dirs
+        assert code == 1 and "not pinned" in err, err
+        f = tmp / "x.onnx"; f.write_bytes(b"x")
+        code, _, err = run_capture(lambda: ts.verify_files({"det/inference.onnx": f}, ts.EMBEDDED_CHECKSUMS))
+        assert code == 1 and "placeholder" in err, err
+        print("  PP-OCRv6 mirror not pinned yet -> downloads and verification refuse")
+    else:
+        assert all(ts._HEX64.match(ts.EMBEDDED_CHECKSUMS[f]) for f in ts.PPOCR_FILES)
+        print("  PP-OCRv6 mirror pinned:", ts.PPOCR_HF_REVISION[:12])
+    code, _, err = run_capture(lambda: ts.get_ppocr_dir(str(tmp / "nowhere")))
+    assert code == 1 and "PP-OCRv6 files not found" in err
+
+
 if __name__ == "__main__":
     tmp = Path(tempfile.mkdtemp())
     for t in (test_embedding_table, test_logits_slice, test_parity_and_batch,
-              test_model_files_and_checksums):
+              test_model_files_and_checksums, test_yaml_and_decode, test_det_geometry,
+              test_quality_gate, test_ppocr_engine_and_fallback, test_ppocr_pinning):
         print(t.__name__)
         t(tmp)
     print("ALL PASSED")

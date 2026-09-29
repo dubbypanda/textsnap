@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-textsnap.py - Lean CPU OCR using PaddleOCR-VL-1.5 ONNX (quantized).
+textsnap.py - Lean CPU OCR: PP-OCRv6 first, PaddleOCR-VL-1.5 when it matters.
 
 Snap any image, screenshot, or webpage into plaintext. No GPU. No cloud.
 One command.
@@ -11,39 +11,50 @@ Usage:
     textsnap https://.../x.png        # OCR a direct image URL
     textsnap https://example.com/page # OCR the biggest image on a webpage
     textsnap a.png b.png scans/*.jpg  # batch: models are loaded once
+    textsnap page.png --structured    # markdown (tables, headings) via the VLM
+
+Engines:
+    By default every image goes through PP-OCRv6 medium (text detection +
+    line recognition, 34.5M parameters, ~140 MB). Its per-line confidences
+    and a few cheap linguistic checks give a page-quality score; if that
+    falls below --min-quality (default 0.8) the image is re-read by
+    PaddleOCR-VL-1.5 (0.9B VLM, ~1.1 GB, downloaded on first need).
+    --structured (alias --markdown) skips PP-OCRv6 and asks the VLM for its
+    native markdown directly.
 
 Options:
-    --plaintext     Strip markdown -> plain text (default output is the model's
-                    native markdown).
+    --structured    VLM only, markdown output (tables, headings preserved).
+    --plaintext     With --structured: flatten the markdown to plain text.
+    --min-quality Q Fallback threshold, 0..1 (default 0.8; 0 = never fall back).
+    --lang L        Word-check language(s) for the quality score, e.g. en,fr.
     -o, --output    Output .txt path. Default: ./textsnaps/<name>_ocr.txt.
-    --model-dir DIR Use ONNX/config files from DIR instead of downloading.
-    --max-tokens N  Cap generated tokens (default 2048).
-    --max-pixels N  Image pixel budget for the vision encoder (default is the
-                    model's max). Lower trades accuracy for speed.
-    --vision V      Vision-encoder variant: q8 (default) or q4.
+    --model-dir DIR Use model files from DIR instead of downloading.
+    --max-tokens N  VLM: cap generated tokens (default 2048).
+    --max-pixels N  VLM: image pixel budget for the vision encoder.
+    --vision V      VLM: vision-encoder variant, q8 (default) or q4.
 
 Output:
-    Plaintext, UTF-8. Default location is ./textsnaps/ (created if missing)
-    under the current working directory; override with -o (with several
-    inputs, -o names a directory; one output path per line). The filename is
-    "<name>_ocr.txt", where <name> is the image filename stem (for image
-    inputs) or the webpage slug (for HTML inputs).
+    Plaintext, UTF-8 (markdown with --structured). Default location is
+    ./textsnaps/ (created if missing) under the current working directory;
+    override with -o (with several inputs, -o names a directory; one output
+    path per line). The filename is "<name>_ocr.txt", where <name> is the
+    image filename stem (for image inputs) or the webpage slug (for HTML
+    inputs).
 
     When the input image comes from the clipboard (textsnap run with no
     arguments), the OCR text is ALSO copied back to the clipboard so it can
     be pasted immediately -- the .txt file is still written as well.
 
 Model files:
-    The 3 ONNX components (~1.1 GB) are auto-downloaded on first run and
-    cached in ~/.cache/textsnap. The decoder uses the q4 variant; the vision
-    encoder defaults to q8 (--vision q4 selects the smaller 4-bit build).
-    The embedding table ships fp32 only and is memory-mapped rather than
-    run through ONNX Runtime.
+    Downloaded on first use and cached in ~/.cache/textsnap:
+      ppocr/det/*, ppocr/rec/*   PP-OCRv6 medium ONNX (~140 MB), always.
+      onnx/*, tokenizer.json     PaddleOCR-VL-1.5 ONNX (~1.1 GB), only the
+                                 first time a page falls back or
+                                 --structured is used.
 
     Portable mode: if the model files are found next to this script
-    (./onnx/* + ./tokenizer.json), they are used directly -- no
-    download, no --model-dir flag, no setup. Copy the textsnap folder
-    together with its model files to any machine and run it offline.
+    (./ppocr/... and/or ./onnx/* + ./tokenizer.json), they are used
+    directly -- no download, no --model-dir flag, no setup.
 """
 
 import sys
@@ -61,6 +72,7 @@ from urllib.parse import urlparse, unquote
 # Logging: all diagnostics go to stderr and are silent unless -v is passed.
 # stdout is reserved for the one thing a Unix pipe wants -- the output path.
 # --------------------------------------------------------------------------
+__version__ = "0.4.0"
 VERBOSE = False
 
 
@@ -117,6 +129,8 @@ REQUIRED = {
     "bs4": "beautifulsoup4",
     "readability": "readability-lxml",
     "lxml": "lxml",
+    "cv2": "opencv-python-headless",
+    "wordfreq": "wordfreq",
 }
 
 
@@ -244,6 +258,50 @@ def model_files(vision=DEFAULT_VISION):
 
 
 # --------------------------------------------------------------------------
+# 1b. PP-OCRv6 medium (the default engine)
+# --------------------------------------------------------------------------
+# textsnap's own mirror of PaddlePaddle's official ONNX exports:
+#   PaddlePaddle/PP-OCRv6_medium_det_onnx @ 61323801669c338b7891481ec7bac61ce31b576a
+#   PaddlePaddle/PP-OCRv6_medium_rec_onnx @ 50c7eacafc52fa7bcf4194e8cd08e46f8558504b
+# (byte-identical, repacked as det/ and rec/ in one repo). Downloads are
+# pinned to this revision and verified against the digests below.
+PPOCR_HF_REPO = "kouhxp/PP-OCRv6_medium-ONNX"
+PPOCR_HF_REVISION = "75776f6b3864e7b3d2144c29e0278243b60e4e8f"
+PPOCR_SUBDIR = "ppocr"          # under the cache / portable / --model-dir root
+PPOCR_FILES = ["det/inference.onnx", "det/inference.yml",
+               "rec/inference.onnx", "rec/inference.yml"]
+PPOCR_CHECKSUMS = {
+    "det/inference.onnx": "eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1",
+    "det/inference.yml": "7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871",
+    "rec/inference.onnx": "9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba",
+    "rec/inference.yml": "991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129",
+}
+EMBEDDED_CHECKSUMS.update(PPOCR_CHECKSUMS)
+
+# Detection preprocessing, as in PaddleOCR 3.x's general OCR pipeline:
+# upscale so the SHORT side is at least 64 px, cap the long side at 4000,
+# snap both to multiples of 32. The DB post-processing thresholds come from
+# the model's own inference.yml; these are fallbacks.
+DET_LIMIT_SIDE = 64
+DET_MAX_SIDE = 4000
+DET_DEFAULTS = {"thresh": 0.3, "box_thresh": 0.6, "unclip_ratio": 1.5,
+                "max_candidates": 1000}
+DET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+DET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+DET_MIN_BOX = 3
+# Recognition: text lines are resized to height 48, width by aspect ratio
+# (at least 320, at most 3200), and batched by similar aspect ratio.
+REC_HEIGHT = 48
+REC_MIN_WIDTH = 320
+REC_MAX_WIDTH = 3200
+REC_BATCH = 6
+
+# Quality gate: share of characters that sit in lines passing line_ok().
+DEFAULT_MIN_QUALITY = 0.8
+DEFAULT_LANGS = "en"
+
+
+# --------------------------------------------------------------------------
 # 2. Input detection: figure out what the positional arg is
 # --------------------------------------------------------------------------
 def detect_input(arg):
@@ -296,7 +354,7 @@ def detect_input(arg):
 # 3. Load image from each input kind
 # --------------------------------------------------------------------------
 def _download_bytes(url):
-    r = requests.get(url, timeout=60, headers={"User-Agent": "textsnap/1.0"})
+    r = requests.get(url, timeout=60, headers={"User-Agent": f"textsnap/{__version__}"})
     r.raise_for_status()
     return r.content
 
@@ -370,7 +428,7 @@ def load_from_html_url(url):
     from urllib.parse import urljoin
 
     html = requests.get(url, timeout=60,
-                         headers={"User-Agent": "textsnap/1.0"}).text
+                         headers={"User-Agent": f"textsnap/{__version__}"}).text
     doc = Document(html)
     main_html = doc.summary()           # de-fluffed main content
     title = doc.short_title() or urlparse(url).netloc
@@ -556,6 +614,10 @@ def fit_pixel_values(pixel_values, declared_shape):
 # --------------------------------------------------------------------------
 # 6. Model download + integrity verification
 # --------------------------------------------------------------------------
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+
 def _sha256_file(path, chunk=1 << 20):
     """Stream a file through SHA-256 without loading it all into memory."""
     h = hashlib.sha256()
@@ -608,6 +670,11 @@ def verify_files(file_map, checksums):
         if not expected:
             log(f"[textsnap]   (no pinned checksum for {name} -- skipped)")
             continue
+        if not _HEX64.match(expected):
+            raise SystemExit(
+                f"[textsnap] No pinned checksum for {name} yet (placeholder "
+                f"'{expected}'). Pin its SHA-256 in textsnap.py, or "
+                f"pass --no-verify for local experiments.")
         actual = _sha256_file(path)
         if actual != expected:
             raise SystemExit(
@@ -714,6 +781,77 @@ def get_model_dir(override=None, verify=True, vision=DEFAULT_VISION):
     log(f"[textsnap] Integrity OK ({n} files verified).")
 
     return CACHE_DIR
+
+
+def _script_dirs():
+    """Directories that count as 'next to the script' for portable mode."""
+    out = []
+    try:
+        out.append(Path(__file__).resolve().parent)
+    except NameError:
+        pass
+    if getattr(sys, "frozen", False):
+        out.append(Path(sys.executable).resolve().parent)
+    return out
+
+
+def _looks_like_ppocr_dir(d):
+    d = Path(d)
+    return all((d / f).is_file() for f in PPOCR_FILES)
+
+
+def vlm_available(override=None, vision=DEFAULT_VISION):
+    """True if the VLM can load without a download (used to warn before a
+    fallback triggers the ~1.1 GB first-time fetch)."""
+    if override:
+        return True
+    if _portable_model_dir(vision) is not None:
+        return True
+    return all((CACHE_DIR / f).is_file() for f in model_files(vision))
+
+
+def get_ppocr_dir(override=None, verify=True):
+    """Directory holding det/ and rec/ for PP-OCRv6 medium. Same resolution
+    order as the VLM: --model-dir, then portable, then the OS cache."""
+    if override:
+        d = Path(override) / PPOCR_SUBDIR
+        if not _looks_like_ppocr_dir(d):
+            raise SystemExit(
+                f"[textsnap] --model-dir {override}: PP-OCRv6 files not found "
+                f"under {d} (expected {', '.join(PPOCR_FILES)}).")
+        return d
+    for c in _script_dirs():
+        if _looks_like_ppocr_dir(c / PPOCR_SUBDIR):
+            log(f"[textsnap] Portable mode: PP-OCRv6 files next to the "
+                f"script ({c / PPOCR_SUBDIR}); integrity check skipped.")
+            return c / PPOCR_SUBDIR
+
+    if not _HEX40.match(PPOCR_HF_REVISION):
+        raise SystemExit(
+            "[textsnap] The PP-OCRv6 mirror revision is not pinned yet "
+            "(PPOCR_HF_REVISION). Pin it in textsnap.py, or point "
+            "--model-dir at a directory containing ppocr/det and ppocr/rec.")
+
+    from huggingface_hub import hf_hub_download
+
+    dest = CACHE_DIR / PPOCR_SUBDIR
+    dest.mkdir(parents=True, exist_ok=True)
+    log("[textsnap] Ensuring PP-OCRv6 files are cached (~140 MB on first "
+        "run)...")
+    downloaded = {}
+    for fname in PPOCR_FILES:
+        downloaded[fname] = hf_hub_download(
+            repo_id=PPOCR_HF_REPO, filename=fname,
+            revision=PPOCR_HF_REVISION, local_dir=str(dest))
+    if not verify:
+        log("[textsnap] WARNING: --no-verify set -- skipping PP-OCRv6 "
+            "integrity check.")
+        return dest
+    checksums, source = _pinned_checksums()
+    n = verify_files(downloaded, checksums)
+    log(f"[textsnap] PP-OCRv6 integrity OK ({n} files verified against "
+        f"{source}).")
+    return dest
 
 
 # --------------------------------------------------------------------------
@@ -1783,6 +1921,424 @@ def run_ocr(img, model_dir, max_tokens=2048, max_pixels=MAX_PIXELS,
 
 
 # --------------------------------------------------------------------------
+# 9b. PP-OCRv6: text detection (DB) + line recognition (CTC) on ONNX Runtime
+#
+# A re-implementation of the slice of PaddleOCR's general OCR pipeline that
+# textsnap needs (no doc unwarping, no orientation classifiers), so the
+# `paddleocr` / `paddlepaddle` packages are not required. Pre/post-processing
+# follows PaddleOCR 3.x: DetResizeForTest + NormalizeImage, DBPostProcess in
+# "quad" mode, get_rotate_crop_image, OCRReisizeNormImg, CTCLabelDecode.
+# Both models expect BGR input, as they were trained on cv2-decoded images.
+# --------------------------------------------------------------------------
+def _yaml_scalar(v):
+    """Unquote one YAML plain/quoted scalar (the subset inference.yml uses)."""
+    # Strip ASCII blanks only: str.strip() would also eat U+3000 (the
+    # ideographic space), which is a real entry in PP-OCR dictionaries.
+    v = v.strip(" \t\r\n")
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        import json
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v[1:-1].encode("utf-8").decode("unicode_escape")
+    return v
+
+
+def parse_inference_yml(text):
+    """Pull what textsnap needs out of a PaddleX inference.yml without a YAML
+    dependency: the PostProcess scalars and its character_dict list.
+    Returns {"PostProcess": {key: str | list}}."""
+    post, in_post, list_key = {}, False, None
+    for raw in text.splitlines():
+        stripped = raw.strip(" \t\r")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent == 0:
+            in_post = stripped == "PostProcess:"
+            list_key = None
+            continue
+        if not in_post:
+            continue
+        if list_key and (stripped == "-" or stripped.startswith("- ")):
+            post[list_key].append(_yaml_scalar(stripped[2:]) if
+                                  stripped != "-" else "")
+            continue
+        m = re.match(r"^([A-Za-z_][\w]*):(?:\s+(.*))?$", stripped)
+        if m and indent <= 2:
+            key, val = m.group(1), m.group(2)
+            if val is None or val == "":
+                post[key], list_key = [], key
+            else:
+                post[key], list_key = _yaml_scalar(val), None
+    return {"PostProcess": post}
+
+
+def _order_quad(pts):
+    """cv2.boxPoints -> [top-left, top-right, bottom-right, bottom-left],
+    exactly as PaddleOCR's get_mini_boxes orders them."""
+    p = sorted(list(pts), key=lambda x: x[0])
+    i1, i4 = (0, 1) if p[1][1] > p[0][1] else (1, 0)
+    i2, i3 = (2, 3) if p[3][1] > p[2][1] else (3, 2)
+    return np.array([p[i1], p[i2], p[i3], p[i4]], dtype=np.float32)
+
+
+def _mini_box(points):
+    import cv2
+    rect = cv2.minAreaRect(np.asarray(points, dtype=np.float32))
+    return _order_quad(cv2.boxPoints(rect)), min(rect[1])
+
+
+def _box_score(pred, quad):
+    """Mean probability inside the quad (PaddleOCR's box_score_fast)."""
+    import cv2
+    h, w = pred.shape
+    xmin = int(np.clip(np.floor(quad[:, 0].min()), 0, w - 1))
+    xmax = int(np.clip(np.ceil(quad[:, 0].max()), 0, w - 1))
+    ymin = int(np.clip(np.floor(quad[:, 1].min()), 0, h - 1))
+    ymax = int(np.clip(np.ceil(quad[:, 1].max()), 0, h - 1))
+    mask = np.zeros((ymax - ymin + 1, xmax - xmin + 1), dtype=np.uint8)
+    q = quad.copy()
+    q[:, 0] -= xmin
+    q[:, 1] -= ymin
+    cv2.fillPoly(mask, q.reshape(1, -1, 2).astype(np.int32), 1)
+    return cv2.mean(pred[ymin:ymax + 1, xmin:xmax + 1], mask)[0]
+
+
+def _unclip_rect(quad, ratio):
+    """Grow a rectangle by the DB 'unclip' distance d = area*ratio/perimeter.
+    PaddleOCR offsets the polygon with pyclipper and then takes the minimum
+    area rectangle of the result; for a rectangle input that is exactly the
+    rectangle grown by d on every side, so no clipper library is needed."""
+    u = quad[1] - quad[0]
+    v = quad[3] - quad[0]
+    w, h = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    if w < 1e-6 or h < 1e-6:
+        return quad
+    d = (w * h) * ratio / (2 * (w + h))
+    u, v = u / w, v / h
+    c = quad.mean(axis=0)
+    a, b = (w / 2 + d) * u, (h / 2 + d) * v
+    return np.array([c - a - b, c + a - b, c + a + b, c - a + b],
+                    dtype=np.float32)
+
+
+def db_boxes(pred, orig_w, orig_h, thresh, box_thresh, unclip_ratio,
+             max_candidates=1000, min_size=DET_MIN_BOX):
+    """DBPostProcess ('quad' box type): probability map -> text quads in
+    original-image pixels, each with its detection score."""
+    import cv2
+    h, w = pred.shape
+    bitmap = (pred > thresh).astype(np.uint8) * 255
+    contours = cv2.findContours(bitmap, cv2.RETR_LIST,
+                                cv2.CHAIN_APPROX_SIMPLE)[-2]
+    boxes, scores = [], []
+    for contour in contours[:max_candidates]:
+        quad, sside = _mini_box(contour.reshape(-1, 2))
+        if sside < min_size:
+            continue
+        score = _box_score(pred, quad)
+        if score < box_thresh:
+            continue
+        quad, sside = _mini_box(_unclip_rect(quad, unclip_ratio))
+        if sside < min_size + 2:
+            continue
+        quad[:, 0] = np.clip(np.round(quad[:, 0] / w * orig_w), 0, orig_w)
+        quad[:, 1] = np.clip(np.round(quad[:, 1] / h * orig_h), 0, orig_h)
+        if (np.linalg.norm(quad[0] - quad[1]) <= 3
+                or np.linalg.norm(quad[0] - quad[3]) <= 3):
+            continue
+        boxes.append(quad)
+        scores.append(float(score))
+    return boxes, scores
+
+
+def det_resize(h, w, limit=DET_LIMIT_SIDE, max_side=DET_MAX_SIDE):
+    """DetResizeForTest(limit_type='min') + max_side_limit, snapped to 32."""
+    ratio = limit / min(h, w) if min(h, w) < limit else 1.0
+    if max(h, w) * ratio > max_side:
+        ratio = max_side / max(h, w)
+    rh = max(int(round(h * ratio / 32) * 32), 32)
+    rw = max(int(round(w * ratio / 32) * 32), 32)
+    return rh, rw
+
+
+def crop_quad(img, quad):
+    """Perspective-crop one text quad to an upright strip
+    (PaddleOCR's get_rotate_crop_image)."""
+    import cv2
+    cw = int(max(np.linalg.norm(quad[0] - quad[1]),
+                 np.linalg.norm(quad[2] - quad[3])))
+    ch = int(max(np.linalg.norm(quad[0] - quad[3]),
+                 np.linalg.norm(quad[1] - quad[2])))
+    cw, ch = max(cw, 1), max(ch, 1)
+    dst = np.float32([[0, 0], [cw, 0], [cw, ch], [0, ch]])
+    m = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    out = cv2.warpPerspective(img, m, (cw, ch),
+                              borderMode=cv2.BORDER_REPLICATE,
+                              flags=cv2.INTER_CUBIC)
+    if out.shape[0] / out.shape[1] >= 1.5:          # vertical line
+        out = np.rot90(out)
+    return out
+
+
+def ctc_decode(probs, charset):
+    """Greedy CTC: collapse repeats, drop blanks (index 0). Returns
+    [(text, score)], score = mean max-probability of the kept characters
+    (0.0 for an empty line), as in PaddleOCR's CTCLabelDecode."""
+    idx = probs.argmax(axis=-1)
+    prob = probs.max(axis=-1)
+    out = []
+    for row_i, row_p in zip(idx, prob):
+        keep = np.ones(len(row_i), dtype=bool)
+        keep[1:] = row_i[1:] != row_i[:-1]
+        keep &= row_i != 0
+        chars = [charset[k] for k in row_i[keep] if k < len(charset)]
+        out.append(("".join(chars),
+                    float(row_p[keep].mean()) if keep.any() else 0.0))
+    return out
+
+
+def assemble_lines(boxes, texts):
+    """Reading-order plaintext from recognized quads: group quads into rows
+    by vertical overlap, left-to-right inside a row, and a blank line where
+    the vertical gap suggests a new paragraph."""
+    items = [(b, t) for b, t in zip(boxes, texts) if t.strip()]
+    if not items:
+        return ""
+    items.sort(key=lambda it: (it[0][:, 1].mean(), it[0][:, 0].min()))
+    rows = []                     # [top, bottom, [(xmin, text)]]
+    for b, t in items:
+        top, bot = b[:, 1].min(), b[:, 1].max()
+        hgt = max(bot - top, 1.0)
+        for r in rows[-3:]:       # rows are appended top-down; look back a bit
+            ov = min(bot, r[1]) - max(top, r[0])
+            if ov > 0.5 * min(hgt, r[1] - r[0]):
+                r[0], r[1] = min(r[0], top), max(r[1], bot)
+                r[2].append((b[:, 0].min(), t.strip()))
+                break
+        else:
+            rows.append([top, bot, [(b[:, 0].min(), t.strip())]])
+    rows.sort(key=lambda r: r[0])
+    heights = sorted(r[1] - r[0] for r in rows)
+    med = heights[len(heights) // 2] or 1.0
+    lines, prev_bot = [], None
+    for top, bot, cells in rows:
+        if prev_bot is not None and top - prev_bot > 0.9 * med:
+            lines.append("")
+        lines.append(" ".join(t for _, t in sorted(cells)))
+        prev_bot = bot
+    return "\n".join(lines)
+
+
+class PPOCREngine:
+    """PP-OCRv6 medium det + rec, loaded once.
+
+    engine = PPOCREngine(ppocr_dir)
+    res = engine.recognize(img)   # {'rec_texts', 'rec_scores', 'rec_polys',
+                                  #  'text'}
+    """
+
+    def __init__(self, ppocr_dir):
+        import time
+        t0 = time.time()
+        d = Path(ppocr_dir)
+        self.det = make_session(d / "det" / "inference.onnx", role="vision")
+        self.rec = make_session(d / "rec" / "inference.onnx", role="vision")
+        det_post = parse_inference_yml(
+            (d / "det" / "inference.yml").read_text(encoding="utf-8")
+        )["PostProcess"]
+        self.det_params = {}
+        for k, dflt in DET_DEFAULTS.items():
+            try:
+                self.det_params[k] = type(dflt)(det_post.get(k, dflt))
+            except (TypeError, ValueError):
+                self.det_params[k] = dflt
+        rec_post = parse_inference_yml(
+            (d / "rec" / "inference.yml").read_text(encoding="utf-8")
+        )["PostProcess"]
+        chars = rec_post.get("character_dict")
+        if not isinstance(chars, list) or not chars:
+            raise SystemExit("[textsnap] PP-OCRv6 rec/inference.yml has no "
+                             "character_dict.")
+        self._chars = chars
+        self._charset = None          # fixed on first run (needs out dim)
+        self._det_in = self.det.get_inputs()[0].name
+        self._rec_in = self.rec.get_inputs()[0].name
+        out_dim = self.rec.get_outputs()[0].shape[-1]
+        if isinstance(out_dim, int):
+            self._set_charset(out_dim)
+        self.last_stats = {}
+        self.load_seconds = time.time() - t0
+        log(f"[textsnap] PP-OCRv6 loaded in {self.load_seconds:.1f}s "
+            f"(det {self.det_params}, {len(chars)} characters).")
+
+    def _set_charset(self, n_classes):
+        # CTCLabelDecode: index 0 is the blank, then the dictionary, then a
+        # space when use_space_char is on (it is for PP-OCR rec models).
+        cs = ["<blank>"] + list(self._chars)
+        if n_classes == len(cs) + 1:
+            cs.append(" ")
+        if n_classes != len(cs):
+            raise SystemExit(
+                f"[textsnap] PP-OCRv6 rec model has {n_classes} classes but "
+                f"its dictionary implies {len(cs)} -- mismatched files?")
+        self._charset = cs
+
+    # ---- detection ---------------------------------------------------------
+    def detect(self, bgr):
+        import cv2
+        h, w = bgr.shape[:2]
+        rh, rw = det_resize(h, w)
+        x = cv2.resize(bgr, (rw, rh)).astype(np.float32) / 255.0
+        x = (x - DET_MEAN) / DET_STD
+        x = x.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+        pred = self.det.run(None, {self._det_in: x})[0]
+        pred = pred.reshape(pred.shape[-2], pred.shape[-1])
+        p = self.det_params
+        return db_boxes(pred, w, h, p["thresh"], p["box_thresh"],
+                        p["unclip_ratio"], int(p["max_candidates"]))
+
+    # ---- recognition -------------------------------------------------------
+    def _rec_batch(self, crops):
+        import cv2
+        max_ratio = max([REC_MIN_WIDTH / REC_HEIGHT]
+                        + [c.shape[1] / max(c.shape[0], 1) for c in crops])
+        width = min(int(REC_HEIGHT * max_ratio), REC_MAX_WIDTH)
+        batch = np.zeros((len(crops), 3, REC_HEIGHT, width), np.float32)
+        for i, c in enumerate(crops):
+            rw = min(width, int(np.ceil(REC_HEIGHT * c.shape[1]
+                                        / max(c.shape[0], 1))))
+            rw = max(rw, 1)
+            r = cv2.resize(c, (rw, REC_HEIGHT)).astype(np.float32)
+            batch[i, :, :, :rw] = (r.transpose(2, 0, 1) / 255.0 - 0.5) / 0.5
+        out = self.rec.run(None, {self._rec_in: batch})[0]
+        if self._charset is None:
+            self._set_charset(out.shape[-1])
+        # The export ends in softmax; guard against one that doesn't.
+        if out.min() < 0 or not np.allclose(out.sum(-1), 1.0, atol=1e-2):
+            out = np.exp(out - out.max(-1, keepdims=True))
+            out /= out.sum(-1, keepdims=True)
+        return ctc_decode(out, self._charset)
+
+    def recognize_crops(self, crops):
+        """[(text, score)] for BGR line crops, in input order."""
+        order = sorted(range(len(crops)),
+                       key=lambda i: crops[i].shape[1] / max(crops[i].shape[0], 1))
+        res = [None] * len(crops)
+        for s in range(0, len(order), REC_BATCH):
+            ids = order[s:s + REC_BATCH]
+            for i, r in zip(ids, self._rec_batch([crops[i] for i in ids])):
+                res[i] = r
+        return res
+
+    def recognize(self, img):
+        """OCR one PIL image. Returns a dict in the shape of a PaddleOCR
+        page result (rec_texts / rec_scores / rec_polys, aligned) plus
+        'text', the assembled plaintext. Timings go to self.last_stats."""
+        import time
+        bgr = np.ascontiguousarray(np.asarray(img.convert("RGB"))[:, :, ::-1])
+        t0 = time.time()
+        boxes, _ = self.detect(bgr)
+        t1 = time.time()
+        rec = self.recognize_crops([crop_quad(bgr, b) for b in boxes])
+        t2 = time.time()
+        texts = [t for t, _ in rec]
+        scores = [s for _, s in rec]
+        self.last_stats = {"det_s": t1 - t0, "rec_s": t2 - t1,
+                           "lines": len(boxes)}
+        log(f"[textsnap] PP-OCRv6: {len(boxes)} lines "
+            f"(det {t1 - t0:.2f}s, rec {t2 - t1:.2f}s).")
+        return {"rec_texts": texts, "rec_scores": scores, "rec_polys": boxes,
+                "text": assemble_lines(boxes, texts)}
+
+
+# --------------------------------------------------------------------------
+# 9c. Quality gate: is the PP-OCRv6 page good enough, or ask the VLM?
+#
+# The recognizer's line score is roughly the mean of per-character max
+# probabilities, so it can be confident about garbage (a stamp, a table
+# border read as '|||', a signature read as 'llIl1') and is least reliable
+# on very short lines. It is therefore one signal among several cheap
+# linguistic ones, combined per line and then weighted by character count
+# per page, so one bad header can't sink an otherwise clean page.
+# --------------------------------------------------------------------------
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]")
+_WORD = re.compile(r"[^\W\d_]{2,}")
+_REPEAT = re.compile(r"(.)\1{4,}")
+_STROKES = re.compile(r"^[lI1|!ǀ\s]+$")
+_ALLOWED_INNER = set("-./:,'’_%&+@#")
+
+
+def _zipf_lookup():
+    """wordfreq.zipf_frequency, memoized; None if wordfreq is unavailable
+    (the dictionary check is then skipped, the others still run)."""
+    try:
+        from wordfreq import zipf_frequency
+    except Exception:            # ImportError, or its data failing to load
+        log("[textsnap] wordfreq unavailable -- dictionary check skipped.")
+        return None
+    from functools import lru_cache
+    return lru_cache(maxsize=65536)(zipf_frequency)
+
+
+_ZIPF = False                    # sentinel: not looked up yet
+
+
+def _is_word(w, langs):
+    global _ZIPF
+    if _ZIPF is False:
+        _ZIPF = _zipf_lookup()
+    if _ZIPF is None:
+        return True
+    lw = w.lower()
+    return any(_ZIPF(lw, lang) > 1.5 for lang in langs)
+
+
+def _jumbled(tok):
+    """Letters, digits and odd symbols mixed inside one token ('a1#b')."""
+    t = tok.strip(".,;:!?()[]{}\"'«»“”‘’")
+    if len(t) < 3:
+        return False
+    has_l = any(c.isalpha() for c in t)
+    has_d = any(c.isdigit() for c in t)
+    odd = any(not c.isalnum() and c not in _ALLOWED_INNER for c in t)
+    return has_l and has_d and odd
+
+
+def line_ok(text, score, langs=("en",), min_score=0.80):
+    t = text.strip()
+    if len(t) < 2 or score < min_score:
+        return False
+    non_alnum = sum(not (c.isalnum() or c.isspace()) for c in t) / len(t)
+    if non_alnum > 0.35 or _REPEAT.search(t) or _STROKES.match(t):
+        return False
+    toks = t.split()
+    if len(toks) >= 2 and sum(map(_jumbled, toks)) * 2 >= len(toks):
+        return False
+    # Dictionary hit rate, on words wordfreq can judge without a segmenter.
+    words = [w for w in _WORD.findall(t) if not _CJK.search(w)]
+    if len(words) >= 3:
+        hits = sum(_is_word(w, langs) for w in words) / len(words)
+        if hits < 0.5:
+            return False
+    return True
+
+
+def page_quality(res, langs=("en",)):
+    """Share of characters (0..1) in lines that pass line_ok(). Empty
+    detections (text '' and score 0.0) are ignored; a page with no text at
+    all scores 0, so it goes to the VLM for a second look."""
+    pairs = [(t, s) for t, s in zip(res["rec_texts"], res["rec_scores"])
+             if t.strip()]
+    total = sum(len(t) for t, _ in pairs) or 1
+    good = sum(len(t) for t, s in pairs if line_ok(t, s, langs))
+    return good / total
+
+
+# --------------------------------------------------------------------------
 # 10. Output formatting
 # --------------------------------------------------------------------------
 def to_plaintext(md):
@@ -1806,31 +2362,39 @@ def to_plaintext(md):
 # 11. main
 # --------------------------------------------------------------------------
 def generate_checksums(dest=None):
-    """Download every pinned model file (all vision variants included) and
-    write a fresh model_checksums.sha256.
+    """Download every pinned model file (both repos, all vision variants)
+    and write a fresh model_checksums.sha256.
 
     Used to regenerate the manifest after deliberately moving to a new model
     revision. Writes next to this module by default. Note: this fetches the
-    optional q8 vision encoder too (443 MB beyond the default set).
+    whole VLM (~1.3 GB incl. both vision encoders) as well as PP-OCRv6.
     """
     from huggingface_hub import hf_hub_download
 
-    files = []
+    if not _HEX40.match(PPOCR_HF_REVISION):
+        raise SystemExit("[textsnap] PPOCR_HF_REVISION is not pinned yet; "
+                         "pin it in textsnap.py first.")
+    vl_files = []
     for f in ([f for v in VISION_VARIANTS.values() for f in v]
               + DECODER_FILES + EMBEDDING_FILES + AUX_FILES):
-        if f not in files:
-            files.append(f)
+        if f not in vl_files:
+            vl_files.append(f)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     lines = [
-        f"# textsnap model checksums for {HF_REPO} @ {HF_REVISION}",
+        "# textsnap model checksums -- SHA-256 of every downloaded model file.",
         "# Regenerate with: textsnap --generate-checksums",
     ]
-    for fname in files:
-        local = hf_hub_download(repo_id=HF_REPO, filename=fname,
-                                revision=HF_REVISION, local_dir=str(CACHE_DIR))
-        digest = _sha256_file(local)
-        lines.append(f"{digest}  {fname}")
-        print(f"{digest}  {fname}", file=sys.stderr)
+    for repo, rev, files, local in (
+            (PPOCR_HF_REPO, PPOCR_HF_REVISION, PPOCR_FILES,
+             CACHE_DIR / PPOCR_SUBDIR),
+            (HF_REPO, HF_REVISION, vl_files, CACHE_DIR)):
+        lines.append(f"# {repo} @ {rev}")
+        for fname in files:
+            path = hf_hub_download(repo_id=repo, filename=fname, revision=rev,
+                                   local_dir=str(local))
+            digest = _sha256_file(path)
+            lines.append(f"{digest}  {fname}")
+            print(f"{digest}  {fname}", file=sys.stderr)
 
     if dest is None:
         dest = Path(__file__).resolve().parent / CHECKSUM_MANIFEST
@@ -1907,15 +2471,97 @@ def _report_failure(label, e, failures):
     failures.append(label)
 
 
+class _Engines:
+    """Loads each engine lazily, at most once per run, so a batch pays for
+    a model only if some input actually needs it."""
+
+    def __init__(self, args):
+        self.args = args
+        self._ppocr = None
+        self._vlm = None
+        self.vlm_failed = None       # reason, once a fallback load failed
+
+    def ppocr(self):
+        if self._ppocr is None:
+            a = self.args
+            self._ppocr = PPOCREngine(get_ppocr_dir(a.model_dir,
+                                                    verify=not a.no_verify))
+        return self._ppocr
+
+    def vlm(self, announce=False):
+        if self._vlm is None:
+            a = self.args
+            if announce and not vlm_available(a.model_dir, a.vision):
+                # A silent 1.1 GB download mid-batch would look like a hang.
+                print("[textsnap] Low-confidence page: fetching "
+                      "PaddleOCR-VL (~1.1 GB, one time) for a second read. "
+                      "--min-quality 0 disables this.", file=sys.stderr)
+            model_dir = get_model_dir(a.model_dir, verify=not a.no_verify,
+                                      vision=a.vision)
+            self._vlm = OCREngine(model_dir, vision=a.vision)
+        return self._vlm
+
+    def run_vlm(self, img):
+        a = self.args
+        return self._vlm.recognize(img, max_tokens=a.max_tokens,
+                                   max_pixels=a.max_pixels)
+
+
+def recognize_one(img, eng, args, langs):
+    """The per-image policy. Returns (text, engine_name).
+
+    --structured: VLM markdown (flattened only with --plaintext).
+    default:      PP-OCRv6; if its page quality < --min-quality, the VLM
+                  re-reads the image and its output is flattened to plain
+                  text, so the default mode's format doesn't depend on
+                  which engine answered.
+    """
+    if args.structured:
+        eng.vlm()
+        text = eng.run_vlm(img)
+        return (to_plaintext(text) if args.plaintext else text), "vlm"
+
+    res = eng.ppocr().recognize(img)
+    q = page_quality(res, langs)
+    log(f"[textsnap] Page quality {q:.2f} (threshold {args.min_quality:.2f}).")
+    if q >= args.min_quality or args.min_quality <= 0:
+        return res["text"], "ppocr"
+    if eng.vlm_failed:
+        return res["text"], "ppocr"
+    try:
+        eng.vlm(announce=True)
+    except (Exception, SystemExit) as e:
+        # Keep the PP-OCRv6 text rather than failing the input: the VLM is a
+        # second opinion, not a requirement. Say so once, then stop trying.
+        eng.vlm_failed = str(e) or type(e).__name__
+        print(f"[textsnap] PaddleOCR-VL unavailable ({eng.vlm_failed}); "
+              f"keeping PP-OCRv6 output for low-quality pages.",
+              file=sys.stderr)
+        return res["text"], "ppocr"
+    log("[textsnap] Falling back to PaddleOCR-VL.")
+    return to_plaintext(eng.run_vlm(img)), "vlm"
+
+
+def _quality_arg(v):
+    try:
+        q = float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {v!r}")
+    if not 0.0 <= q <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return q
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="textsnap",
-        description="Lean CPU OCR via PaddleOCR-VL-1.5 ONNX (quantized).",
+        description="Lean CPU OCR: PP-OCRv6 medium, with PaddleOCR-VL-1.5 "
+                    "for low-confidence pages and --structured output.",
     )
     ap.add_argument("inputs", nargs="*", metavar="input",
                     help="image file(s), image URL(s), or webpage URL(s). "
                          "Several inputs are processed in one run with the "
-                         "model loaded once. Omit to read from the "
+                         "models loaded once. Omit to read from the "
                          "clipboard.")
     ap.add_argument("-o", "--output", default=None,
                     help="output .txt path (single input) or directory. "
@@ -1923,26 +2569,44 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print progress diagnostics to stderr. "
                          "By default only the output path is printed.")
+    ap.add_argument("--version", action="version",
+                    version=f"textsnap {__version__}")
+    ap.add_argument("--structured", "--markdown", action="store_true",
+                    dest="structured",
+                    help="skip PP-OCRv6 and run PaddleOCR-VL directly, "
+                         "keeping its native markdown (tables, headings).")
     ap.add_argument("--plaintext", action="store_true",
-                    help="output plain text instead of native markdown.")
+                    help="with --structured: flatten the markdown to plain "
+                         "text. (Default output is already plain text.)")
+    ap.add_argument("--min-quality", type=_quality_arg,
+                    default=_quality_arg(os.environ.get(
+                        "TEXTSNAP_MIN_QUALITY", DEFAULT_MIN_QUALITY)),
+                    help=f"page-quality threshold (0..1) below which "
+                         f"PaddleOCR-VL re-reads the image (default "
+                         f"{DEFAULT_MIN_QUALITY}; env TEXTSNAP_MIN_QUALITY). "
+                         f"0 never falls back.")
+    ap.add_argument("--lang", default=os.environ.get("TEXTSNAP_LANG",
+                                                     DEFAULT_LANGS),
+                    help="comma-separated wordfreq language codes used by "
+                         "the quality check's dictionary test (default "
+                         f"'{DEFAULT_LANGS}'; env TEXTSNAP_LANG), e.g. en,fr.")
     ap.add_argument("--model-dir", default=None,
-                    help="use ONNX/config files from this directory. "
-                         "If omitted, textsnap uses model files found next "
-                         "to the script (portable mode), else the OS cache "
-                         "(downloading on first run).")
+                    help="use model files from this directory (ppocr/det, "
+                         "ppocr/rec, and onnx/* + tokenizer.json for the "
+                         "VLM). If omitted: files next to the script "
+                         "(portable mode), else the OS cache.")
     ap.add_argument("--max-tokens", type=int, default=2048,
-                    help="max generated tokens (default 2048).")
+                    help="VLM: max generated tokens (default 2048).")
     ap.add_argument("--max-pixels", type=int, default=MAX_PIXELS,
-                    help=f"image pixel budget fed to the vision encoder "
+                    help=f"VLM: image pixel budget fed to the vision encoder "
                          f"(default {MAX_PIXELS}). Lower = faster but less "
                          f"accurate; too low makes the model hallucinate. "
                          f"The image is only ever shrunk, never enlarged.")
     ap.add_argument("--vision", choices=list(VISION_VARIANTS),
                     default=os.environ.get("TEXTSNAP_VISION", DEFAULT_VISION),
-                    help=f"vision-encoder variant (default {DEFAULT_VISION}; "
-                         f"env TEXTSNAP_VISION). q4 is a smaller download "
-                         f"(231 vs 443 MB) but slower here. "
-                         f"Outputs differ slightly between variants.")
+                    help=f"VLM vision-encoder variant (default "
+                         f"{DEFAULT_VISION}; env TEXTSNAP_VISION). q4 is a "
+                         f"smaller download (231 vs 443 MB) but slower here.")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip SHA-256 verification of downloaded model files "
                          "(not recommended).")
@@ -1962,6 +2626,8 @@ def main():
     if args.vision not in VISION_VARIANTS:     # bad TEXTSNAP_VISION value
         ap.error(f"invalid vision variant '{args.vision}' "
                  f"(choose from {', '.join(VISION_VARIANTS)})")
+    langs = tuple(x.strip() for x in args.lang.split(",") if x.strip()) \
+        or (DEFAULT_LANGS,)
 
     inputs = _expand_inputs(args.inputs) if args.inputs else [None]
     single = len(inputs) == 1
@@ -1969,14 +2635,14 @@ def main():
             and not Path(args.output).is_dir()):
         ap.error("with several inputs, -o must name a directory")
 
-    engine = None
+    eng = _Engines(args)
     used, failures = set(), []
     for i, arg in enumerate(inputs, 1):
         label = arg if arg is not None else "clipboard"
         if not single:
             log(f"[textsnap] ({i}/{len(inputs)}) {label}")
-        # One input: errors end the run exactly as before. Several: a bad
-        # input is reported and skipped, and the exit status is 1 at the end.
+        # One input: errors end the run. Several: a bad input is reported
+        # and skipped, and the exit status is 1 at the end.
         # (KeyboardInterrupt is not an Exception, so Ctrl-C still stops.)
         try:
             kind, img, stem = load_input(arg)
@@ -1986,30 +2652,26 @@ def main():
             _report_failure(label, e, failures)
             continue
 
-        # Load the model lazily, once, after the first input loads -- a typo
-        # in the only argument shouldn't cost a model load. A model that
-        # fails to load is fatal for the whole batch.
-        if engine is None:
-            model_dir = get_model_dir(args.model_dir,
-                                      verify=not args.no_verify,
-                                      vision=args.vision)
-            engine = OCREngine(model_dir, vision=args.vision)
+        # Models load lazily, once, after the first input loads -- a typo in
+        # the only argument shouldn't cost a model load. A primary engine
+        # that fails to load is fatal for the whole batch.
+        if args.structured:
+            eng.vlm()
+        else:
+            eng.ppocr()
 
         try:
-            result = engine.recognize(img, max_tokens=args.max_tokens,
-                                      max_pixels=args.max_pixels)
+            result, used_engine = recognize_one(img, eng, args, langs)
         except (Exception, SystemExit) as e:
             if single:
                 raise
             _report_failure(label, e, failures)
             continue
 
-        if args.plaintext:
-            result = to_plaintext(result)
-
         out_path = _output_path(stem, args.output, single, used)
         out_path.write_text(result, encoding="utf-8")
-        log(f"[textsnap] Wrote {out_path}  ({len(result)} chars)")
+        log(f"[textsnap] Wrote {out_path}  ({len(result)} chars, "
+            f"{used_engine})")
 
         # Clipboard-in -> clipboard-out: if the image came from the
         # clipboard, put the OCR text straight back so the user can paste it

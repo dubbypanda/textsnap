@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "textsnap"
-version = "0.3.0"
-description = "Snap any image, screenshot, or webpage into plaintext. No GPU. No cloud. One command."
+version = "0.4.0"
+description = "Snap any image, screenshot, or webpage into plaintext. PP-OCRv6 on CPU, PaddleOCR-VL when it matters. No GPU. No cloud."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "kouhxp", email = "hi@kouh.me" }]
-keywords = ["ocr", "paddleocr", "onnx", "cpu", "vlm", "document-parsing", "screenshot"]
+keywords = ["ocr", "paddleocr", "pp-ocrv6", "onnx", "cpu", "vlm", "document-parsing", "screenshot"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -39,6 +39,8 @@ dependencies = [
     "beautifulsoup4>=4.11",
     "readability-lxml>=0.8.1",
     "lxml>=4.9",
+    "opencv-python-headless>=4.8",
+    "wordfreq>=3.0",
 ]
 
 [project.urls]
